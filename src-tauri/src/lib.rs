@@ -106,18 +106,15 @@ pub fn run() {
                 s.local_state = crate::local_state::LocalState::load(&config_dir);
             }
 
-            // Restore GitHub client from keychain in the background
+            // Restore GitHub client from keychain in the background. On Windows
+            // startup, networking/keychain can lag behind process launch, so
+            // retry transient restore failures instead of making the user click
+            // Connect again.
             {
+                let app_handle = app.handle().clone();
                 let state_clone = state_for_cache.clone();
                 tauri::async_runtime::spawn(async move {
-                    match github::GitHubClient::from_keychain().await {
-                        Ok(Some(client)) => {
-                            state_clone.lock().unwrap().github_client = Some(Arc::new(client));
-                            eprintln!("[zync] GitHub client restored from keychain");
-                        }
-                        Ok(None) => eprintln!("[zync] No GitHub token found"),
-                        Err(e) => eprintln!("[zync] GitHub restore failed: {e}"),
-                    }
+                    restore_github_client_with_retry(app_handle, state_clone).await;
                 });
             }
 
@@ -146,6 +143,42 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+async fn restore_github_client_with_retry(
+    app: tauri::AppHandle,
+    state: Arc<Mutex<daemon::DaemonState>>,
+) {
+    const DELAYS: [u64; 5] = [2, 5, 10, 20, 30];
+
+    for attempt in 0..=DELAYS.len() {
+        match github::GitHubClient::from_keychain().await {
+            Ok(Some(client)) => {
+                let username = client.username.clone();
+                state.lock().unwrap().github_client = Some(Arc::new(client));
+                eprintln!("[zync] GitHub client restored from keychain");
+                daemon::pull_latest_if_needed(&app, &state).await;
+                let _ = app.emit(
+                    "sync-updated",
+                    serde_json::json!({
+                        "connected": true,
+                        "username": username,
+                    }),
+                );
+                return;
+            }
+            Ok(None) => {
+                eprintln!("[zync] No GitHub token found");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[zync] GitHub restore failed: {e}");
+                if let Some(delay) = DELAYS.get(attempt) {
+                    tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                }
+            }
+        }
+    }
 }
 
 async fn check_for_updates(app: &tauri::AppHandle, manual: bool) {
@@ -320,6 +353,7 @@ async fn connect_github_cmd(
         let mut s = state.lock().unwrap();
         s.github_client = Some(Arc::new(client));
     } // lock released before get_sync_status_cmd re-acquires it
+    daemon::pull_latest_if_needed(&app, state.inner()).await;
     Ok(daemon::get_sync_status_cmd(state))
 }
 

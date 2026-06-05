@@ -257,6 +257,7 @@ document.getElementById("pull-input").addEventListener("input", (e) => {
 const syncDisconnected = document.getElementById('sync-disconnected');
 const syncConnected    = document.getElementById('sync-connected');
 const syncRollback     = document.getElementById('sync-rollback');
+let syncRestorePoll = null;
 
 function showSyncState(state) {
   syncDisconnected.style.display = state === 'disconnected' ? '' : 'none';
@@ -294,6 +295,21 @@ async function loadSyncStatus() {
   }
 }
 
+function startSyncRestorePolling() {
+  if (syncRestorePoll) return;
+
+  let attempts = 0;
+  syncRestorePoll = setInterval(async () => {
+    attempts += 1;
+    await loadSyncStatus();
+
+    if (syncConnected.style.display !== 'none' || attempts >= 20) {
+      clearInterval(syncRestorePoll);
+      syncRestorePoll = null;
+    }
+  }, 1500);
+}
+
 document.getElementById('btn-connect-github').addEventListener('click', async () => {
   const btn = document.getElementById('btn-connect-github');
   const err = document.getElementById('sync-connect-error');
@@ -302,7 +318,15 @@ document.getElementById('btn-connect-github').addEventListener('click', async ()
   btn.textContent = 'Connecting…';
   err.textContent = '';
   try {
-    await invoke('connect_github_cmd');
+    await Promise.race([
+      invoke('connect_github_cmd'),
+      new Promise((_, reject) => {
+        setTimeout(
+          () => reject(new Error('GitHub did not finish connecting. Check the OAuth Client ID, then try again.')),
+          30000
+        );
+      }),
+    ]);
     await loadSyncStatus();
   } catch (e) {
     err.textContent = String(e);
@@ -409,9 +433,7 @@ function renderSnapshotList(snapshots) {
 
 // Listen for sync updates from daemon
 window.__TAURI__.event.listen('sync-updated', () => {
-  if (syncConnected.style.display !== 'none') {
-    loadSyncStatus();
-  }
+  loadSyncStatus();
   const orbit = document.querySelector('.sync-orbit');
   if (orbit) {
     orbit.classList.add('is-syncing');
@@ -532,6 +554,10 @@ async function init() {
   );
   showScreen("screen-main");
   showTab("sync");
+  await loadSyncStatus();
+  if (syncDisconnected.style.display !== 'none') {
+    startSyncRestorePolling();
+  }
 }
 
 document.addEventListener("DOMContentLoaded", init);

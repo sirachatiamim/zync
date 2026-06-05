@@ -149,7 +149,7 @@ pub fn start(app: tauri::AppHandle, state: Arc<Mutex<DaemonState>>) {
         let app = app.clone();
         let state = state.clone();
         tauri::async_runtime::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 interval.tick().await;
                 ntfy_poll_tick(&app, &state).await;
@@ -159,6 +159,42 @@ pub fn start(app: tauri::AppHandle, state: Arc<Mutex<DaemonState>>) {
 }
 
 // ── Tick helpers ──────────────────────────────────────────────────────────────
+
+pub async fn pull_latest_if_needed(app: &tauri::AppHandle, state: &Arc<Mutex<DaemonState>>) {
+    let (client, last_known, config_dir) = {
+        let s = state.lock().unwrap();
+        let Some(client) = s.github_client.clone() else {
+            return;
+        };
+        (client, s.local_state.last_known_version, s.config_dir.clone())
+    };
+
+    let github_version = match client.read_metadata().await {
+        Ok(Some(m)) => m.metadata.version,
+        Ok(None) => 0,
+        Err(e) => {
+            eprintln!("[zync] GitHub catch-up check failed: {e}");
+            return;
+        }
+    };
+
+    if github_version <= last_known {
+        return;
+    }
+
+    if zen_check::is_zen_running() {
+        state.lock().unwrap().pending_version = Some(github_version);
+        show_notification(app, "New profile available - will sync when Zen closes");
+        return;
+    }
+
+    let Some(_sync_lock) = try_acquire_sync(state) else {
+        state.lock().unwrap().pending_version = Some(github_version);
+        return;
+    };
+
+    handle_pull(&client, github_version, app, state, &config_dir).await;
+}
 
 async fn zen_watcher_tick(app: &tauri::AppHandle, state: &Arc<Mutex<DaemonState>>) {
     let (client, was_running, zen_now_running, config_dir) = {
